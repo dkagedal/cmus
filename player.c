@@ -797,15 +797,17 @@ static int change_sf(int drop)
 	return 0;
 }
 
+/* Called with the consumer lock held. */
 static void _consumer_handle_eof(void)
 {
 	struct track_info *ti;
 
+        producer_lock();
 	if (ip_is_remote(ip)) {
 		_producer_stop();
 		_consumer_drain_and_stop();
 		player_error("lost connection");
-		return;
+		goto out;
 	}
 
 	if (player_info.ti)
@@ -820,7 +822,7 @@ static void _consumer_handle_eof(void)
 			_consumer_drain_and_stop();
 			_player_status_changed();
 		}
-		return;
+		goto out;
 	}
 
 	if (get_next(&ti) == 0) {
@@ -849,66 +851,33 @@ static void _consumer_handle_eof(void)
 		_consumer_drain_and_stop();
 		file_changed(NULL);
 	}
+out:
+	producer_unlock();
 	_player_status_changed();
 }
 
-/*
- * Called when there was nothing more to consume in the buffer.Must be
- * called with the consumer lock held. Output is the same as
- * buffer_get_rpos().
- */
-static int _no_more_input(char **rpos)
-{
-	int size = 0;
-	int underrun = 0;
-
-        /* TODO: Restructure code to not take producer lock from
-         * consumer thread. This should shold be done by signalling
-         * EOF through the buffer. */
-	producer_lock();
-	if (producer_status == PS_PLAYING) {
-		/* must recheck rpos */
-		size = buffer_get_rpos(rpos);
-		if (size == 0) {
-			/* OK. now it's safe to check if we are at EOF */
-			if (ip_eof(ip)) {
-				/* EOF */
-				_consumer_handle_eof();
-			} else {
-				/* possible underrun */
-				underrun = 1;
-				_consumer_position_update();
-			}
-		}
-	}
-	producer_unlock();
-
-	if (underrun) {
-/*		d_print("possible underrun\n"); */
-		/* TODO: this could be handled by a condition variable
-		 * on the buffer instead */
-		consumer_unlock();
-		ms_sleep(10);
-		consumer_lock();
-	}
-
-	return size;
-}
-
 /* Get a chunk of data from the buffer and hand it to the output.
- * Returns the remaining space */
+ * Returns the remaining space. Called with the consumer lock held. */
 static int _consume_from_buffer(int space)
 {
 	int rc, size;
 	char *rpos;
 
 	size = buffer_get_rpos(&rpos);
+	if (size == -1) {
+		/* EOF */
+		_consumer_handle_eof();
+		return space;
+	}
 	if (size == 0) {
-		size = _no_more_input(&rpos);
-		if (size == 0) {
-			/* This has already been handled in _no_more_input. */
-			return 0;
-		}
+		/* Underrun */
+		/* TODO: this could be handled by a condition variable
+		 * on the buffer instead */
+		consumer_unlock();
+		ms_sleep(10);
+		consumer_lock();
+		_consumer_position_update();
+		return space;
 	}
 	if (size > space)
 		size = space;
@@ -995,10 +964,6 @@ static void _producer_buffer(void)
 
         for (int i = 0; i < chunks; i++) {
                 if (!buffer_one_chunk()) {
-                        /* consumer handles EOF */
-                        producer_unlock();
-                        ms_sleep(50);
-                        producer_lock();
                         return;
                 }
         }

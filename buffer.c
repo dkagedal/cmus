@@ -50,6 +50,9 @@ static struct chunk *buffer_chunks = NULL;
 static unsigned int buffer_ridx;
 static unsigned int buffer_widx;
 
+/* 1 if no more data is expected to be written to the buffer. */
+static int buffer_eof = 1;
+
 void buffer_init(void)
 {
 	free(buffer_chunks);
@@ -65,7 +68,7 @@ void buffer_free(void)
 /*
  * @pos: returned pointer to available data
  *
- * Returns number of bytes available at @pos
+ * Returns number of bytes available at @pos or -1 to indicate EOF.
  *
  * After reading bytes mark them consumed calling buffer_consume().
  */
@@ -79,7 +82,9 @@ int buffer_get_rpos(char **pos)
 	if (c->filled) {
 		size = c->h - c->l;
 		*pos = c->data + c->l;
-	}
+	} else if (buffer_eof) {
+            size = -1;
+        }
 	cmus_mutex_unlock(&buffer_mutex);
 
 	return size;
@@ -146,6 +151,8 @@ int buffer_fill(int count)
 		filled = 1;
 	}
 
+        buffer_eof = (count == 0);
+
 	cmus_mutex_unlock(&buffer_mutex);
 	return filled;
 }
@@ -155,6 +162,7 @@ void buffer_reset(void)
 	int i;
 
 	cmus_mutex_lock(&buffer_mutex);
+	buffer_eof = 0;
 	buffer_ridx = 0;
 	buffer_widx = 0;
 	for (i = 0; i < buffer_nr_chunks; i++) {
