@@ -115,18 +115,6 @@ static double replaygain_scale = 1.0;
 #define consumer_lock() cmus_mutex_lock(&consumer_mutex)
 #define consumer_unlock() cmus_mutex_unlock(&consumer_mutex)
 
-#define player_lock() \
-	do { \
-		consumer_lock(); \
-		producer_lock(); \
-	} while (0)
-
-#define player_unlock() \
-	do { \
-		producer_unlock(); \
-		consumer_unlock(); \
-	} while (0)
-
 /* locking }}} */
 
 static void reset_buffer(void)
@@ -1035,21 +1023,28 @@ void player_init(const struct player_callbacks *callbacks)
 	BUG_ON(rc);
 
 	/* update player_info.cont etc. */
-	player_lock();
+	consumer_lock();
+	producer_lock();
 	_player_status_changed();
-	player_unlock();
+	producer_unlock();
+	consumer_unlock();
+
 }
 
 void player_exit(void)
 {
 	int rc;
 
-	player_lock();
+	consumer_lock();
 	consumer_running = 0;
 	pthread_cond_broadcast(&consumer_playing);
+	consumer_unlock();
+
+	producer_lock();
 	producer_running = 0;
 	pthread_cond_broadcast(&producer_playing);
-	player_unlock();
+	producer_unlock();
+
 
 	rc = pthread_join(consumer_thread, NULL);
 	BUG_ON(rc);
@@ -1060,21 +1055,26 @@ void player_exit(void)
 
 void player_stop(void)
 {
-	player_lock();
+	consumer_lock();
+	producer_lock();
 	_consumer_stop();
 	_producer_stop();
 	_player_status_changed();
-	player_unlock();
+	producer_unlock();
+	consumer_unlock();
+
 }
 
 void player_play(void)
 {
 	int do_prebuffer;
 
-	player_lock();
+	consumer_lock();
+	producer_lock();
 	if (producer_status == PS_PLAYING && ip_is_remote(ip)) {
 		/* seeking not allowed */
-		player_unlock();
+		producer_unlock();
+		consumer_unlock();
 		return;
 	}
 	do_prebuffer = consumer_status == CS_STOPPED;
@@ -1087,7 +1087,8 @@ void player_play(void)
 		_consumer_stop();
 	}
 	_player_status_changed();
-	player_unlock();
+	producer_unlock();
+	consumer_unlock();
 	if (do_prebuffer)
 		_prebuffer();
 }
@@ -1102,7 +1103,8 @@ void player_pause(void)
 		return;
 	}
 
-	player_lock();
+	consumer_lock();
+	producer_lock();
 	if (consumer_status == CS_STOPPED) {
 		_producer_play();
 		if (producer_status == PS_PLAYING) {
@@ -1117,7 +1119,8 @@ void player_pause(void)
                 _consumer_pause();
                 _player_status_changed();
         }
-	player_unlock();
+	producer_unlock();
+	consumer_unlock();
 	if (do_prebuffer)
 		_prebuffer();
 }
@@ -1130,7 +1133,8 @@ void player_pause_playback(void)
 
 void player_set_file(struct track_info *ti)
 {
-	player_lock();
+	consumer_lock();
+	producer_lock();
 	_producer_set_file(ti);
 	if (producer_status == PS_UNLOADED) {
 		_consumer_stop();
@@ -1150,14 +1154,16 @@ void player_set_file(struct track_info *ti)
 out:
 	_player_status_changed();
 	int do_prebuffer = (producer_status == PS_PLAYING);
-	player_unlock();
+	producer_unlock();
+	consumer_unlock();
 	if (do_prebuffer)
 		_prebuffer();
 }
 
 void player_play_file(struct track_info *ti)
 {
-	player_lock();
+	consumer_lock();
+	producer_lock();
 	_producer_set_file(ti);
 	if (producer_status == PS_UNLOADED) {
 		_consumer_stop();
@@ -1185,7 +1191,8 @@ void player_play_file(struct track_info *ti)
 out:
 	_player_status_changed();
 	int do_prebuffer = (producer_status == PS_PLAYING);
-	player_unlock();
+	producer_unlock();
+	consumer_unlock();
 	if (do_prebuffer)
 		_prebuffer();
 }
@@ -1198,7 +1205,8 @@ void player_file_changed(struct track_info *ti)
 void player_seek(double offset, int relative, int start_playing)
 {
 	int stopped = 0;
-	player_lock();
+	consumer_lock();
+	producer_lock();
 	if (consumer_status == CS_STOPPED) {
 		stopped = 1;
 		_producer_play();
@@ -1206,7 +1214,8 @@ void player_seek(double offset, int relative, int start_playing)
 			_consumer_play();
 			if (consumer_status != CS_PLAYING) {
 				_producer_stop();
-				player_unlock();
+				producer_unlock();
+				consumer_unlock();
 				return;
 			} else
 				_player_status_changed();
@@ -1221,7 +1230,8 @@ void player_seek(double offset, int relative, int start_playing)
 		if (duration < 0) {
 			/* can't seek */
 			d_print("can't seek\n");
-			player_unlock();
+			producer_unlock();
+			consumer_unlock();
 			return;
 		}
 		if (relative) {
@@ -1237,7 +1247,8 @@ void player_seek(double offset, int relative, int start_playing)
 				if (new_pos < pos - 0.5) {
 					/* must seek at least 0.5s */
 					d_print("must seek at least 0.5s\n");
-					player_unlock();
+					producer_unlock();
+					consumer_unlock();
 					return;
 				}
 			}
@@ -1245,7 +1256,8 @@ void player_seek(double offset, int relative, int start_playing)
 			new_pos = offset;
 			if (new_pos < 0.0) {
 				d_print("seek offset negative\n");
-				player_unlock();
+				producer_unlock();
+				consumer_unlock();
 				return;
 			}
 			if (new_pos > duration - 5.0) {
@@ -1273,7 +1285,9 @@ void player_seek(double offset, int relative, int start_playing)
 			d_print("error: ip_seek returned %d\n", rc);
 		}
 	}
-	player_unlock();
+	producer_unlock();
+	consumer_unlock();
+
 }
 
 /*
@@ -1283,7 +1297,8 @@ void player_set_op(const char *name)
 {
 	int rc;
 
-	player_lock();
+	consumer_lock();
+	producer_lock();
 
 	/* drop needed because close drains the buffer */
 	if (consumer_status == CS_PAUSED)
@@ -1308,7 +1323,9 @@ void player_set_op(const char *name)
 			player_op_error(rc, "selecting output plugin '%s'", name);
 		else
 			player_op_error(rc, "selecting any output plugin");
-		player_unlock();
+		producer_unlock();
+	consumer_unlock();
+
 		return;
 	}
 
@@ -1319,19 +1336,22 @@ void player_set_op(const char *name)
 			_consumer_status_update(CS_STOPPED);
 			_producer_stop();
 			player_op_error(rc, "opening audio device");
-			player_unlock();
+			producer_unlock();
+			consumer_unlock();
 			return;
 		}
 		if (consumer_status == CS_PAUSED)
 			op_pause();
 	}
 
-	player_unlock();
+	producer_unlock();
+	consumer_unlock();
 }
 
 void player_set_buffer_chunks(unsigned int nr_chunks)
 {
-	player_lock();
+	consumer_lock();
+	producer_lock();
 	_producer_stop();
 	_consumer_stop();
 
@@ -1339,7 +1359,9 @@ void player_set_buffer_chunks(unsigned int nr_chunks)
 	buffer_init();
 
 	_player_status_changed();
-	player_unlock();
+	producer_unlock();
+	consumer_unlock();
+
 }
 
 int player_get_buffer_chunks(void)
@@ -1367,7 +1389,8 @@ void player_set_soft_vol(int soft)
 
 void player_set_rg(enum replaygain rg)
 {
-	player_lock();
+	consumer_lock();
+	producer_lock();
 	/* don't mess with scale_pos if soft_vol or replaygain is already enabled */
 	if (!soft_vol && !replaygain)
 		scale_pos = consumer_pos;
@@ -1377,29 +1400,37 @@ void player_set_rg(enum replaygain rg)
 	update_rg_scale();
 	player_info_unlock();
 
-	player_unlock();
+	producer_unlock();
+	consumer_unlock();
+
 }
 
 void player_set_rg_limit(int limit)
 {
-	player_lock();
+	consumer_lock();
+	producer_lock();
 	replaygain_limit = limit;
 
 	player_info_lock();
 	update_rg_scale();
 	player_info_unlock();
 
-	player_unlock();
+	producer_unlock();
+	consumer_unlock();
+
 }
 
 void player_set_rg_preamp(double db)
 {
-	player_lock();
+	consumer_lock();
+	producer_lock();
 	replaygain_preamp = db;
 
 	player_info_lock();
 	update_rg_scale();
 	player_info_unlock();
 
-	player_unlock();
+	producer_unlock();
+	consumer_unlock();
+
 }
