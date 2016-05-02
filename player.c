@@ -567,8 +567,7 @@ static void _player_status_changed(void)
 /* updating player status }}} */
 
 /* Copy one block of data from the input to the player buffer. Returns
- * 0 if ip_read returned 0, indicating EOF, and 1 otherwise. Called
- * with the producer lock held. */
+ * 0 if ip_read returned 0, indicating EOF, and 1 otherwise. */
 static int buffer_one_chunk(void)
 {
         int nr_read, size;
@@ -577,9 +576,7 @@ static int buffer_one_chunk(void)
         size = buffer_get_wpos(&wpos);
         if (size == 0) {
                 /* buffer is full */
-                producer_unlock();
                 ms_sleep(50);
-                producer_lock();
                 return 1;
         }
         nr_read = ip_read(ip, wpos, size);
@@ -956,8 +953,7 @@ static void *consumer_loop(void *arg)
 	return NULL;
 }
 
-/* Do one pass of copying data from the input to the buffer. Called
- * with the producer lock held. */
+/* Do one pass of copying data from the input to the buffer. */
 static void _producer_buffer(void)
 {
         /* number of chunks to fill
@@ -981,11 +977,12 @@ static void *producer_loop(void *arg)
 		while (producer_running && (producer_status != PS_PLAYING || ip_eof(ip))) {
 			pthread_cond_wait(&producer_playing, &producer_mutex);
 		}
-		if (producer_running) {
-			_producer_buffer();
-		}
 		keep_running = producer_running;
 		producer_unlock();
+
+		if (keep_running) {
+			_producer_buffer();
+		}
 	}
 	producer_lock();
 	_producer_unload();
