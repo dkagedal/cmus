@@ -606,6 +606,7 @@ static void _prebuffer(void)
 {
 	int limit_chunks;
 
+	producer_lock();
 	BUG_ON(producer_status != PS_PLAYING);
 	if (ip_is_remote(ip)) {
 		limit_chunks = buffer_nr_chunks;
@@ -618,8 +619,9 @@ static void _prebuffer(void)
 		if (limit_chunks < 1)
 			limit_chunks = 1;
 	}
-	while (buffer_get_filled_chunks() < limit_chunks && buffer_one_chunk()) {
-	}
+	producer_unlock();
+
+	buffer_wait(limit_chunks);
 }
 
 /* setting producer status {{{ */
@@ -801,6 +803,7 @@ static int change_sf(int drop)
 static void _consumer_handle_eof(void)
 {
 	struct track_info *ti;
+	int do_prebuffer = 0;
 
         producer_lock();
 	if (ip_is_remote(ip)) {
@@ -839,8 +842,7 @@ static void _consumer_handle_eof(void)
 			} else {
 				/* PS_PLAYING */
 				file_changed(ti);
-				if (!change_sf(0))
-					_prebuffer();
+				do_prebuffer = !change_sf(0);
 			}
 		} else {
 			_consumer_drain_and_stop();
@@ -853,6 +855,8 @@ static void _consumer_handle_eof(void)
 	}
 out:
 	producer_unlock();
+	if (do_prebuffer)
+		_prebuffer();
 	_player_status_changed();
 }
 
@@ -1068,7 +1072,7 @@ void player_stop(void)
 
 void player_play(void)
 {
-	int prebuffer;
+	int do_prebuffer;
 
 	player_lock();
 	if (producer_status == PS_PLAYING && ip_is_remote(ip)) {
@@ -1076,7 +1080,7 @@ void player_play(void)
 		player_unlock();
 		return;
 	}
-	prebuffer = consumer_status == CS_STOPPED;
+	do_prebuffer = consumer_status == CS_STOPPED;
 	_producer_play();
 	if (producer_status == PS_PLAYING) {
 		_consumer_play();
@@ -1086,13 +1090,15 @@ void player_play(void)
 		_consumer_stop();
 	}
 	_player_status_changed();
-	if (consumer_status == CS_PLAYING && prebuffer)
-		_prebuffer();
 	player_unlock();
+	if (do_prebuffer)
+		_prebuffer();
 }
 
 void player_pause(void)
 {
+	int do_prebuffer = 0;
+
 	if (ip && ip_is_remote(ip) && consumer_status == CS_PLAYING) {
 		/* pausing not allowed */
 		player_stop();
@@ -1108,14 +1114,15 @@ void player_pause(void)
 				_producer_stop();
 		}
 		_player_status_changed();
-		if (consumer_status == CS_PLAYING)
-			_prebuffer();
+		do_prebuffer = (consumer_status == CS_PLAYING);
 	} else {
                 _producer_pause();
                 _consumer_pause();
                 _player_status_changed();
         }
 	player_unlock();
+	if (do_prebuffer)
+		_prebuffer();
 }
 
 void player_pause_playback(void)
@@ -1145,9 +1152,10 @@ void player_set_file(struct track_info *ti)
 	}
 out:
 	_player_status_changed();
-	if (producer_status == PS_PLAYING)
-		_prebuffer();
+	int do_prebuffer = (producer_status == PS_PLAYING);
 	player_unlock();
+	if (do_prebuffer)
+		_prebuffer();
 }
 
 void player_play_file(struct track_info *ti)
@@ -1179,9 +1187,10 @@ void player_play_file(struct track_info *ti)
 	}
 out:
 	_player_status_changed();
-	if (producer_status == PS_PLAYING)
-		_prebuffer();
+	int do_prebuffer = (producer_status == PS_PLAYING);
 	player_unlock();
+	if (do_prebuffer)
+		_prebuffer();
 }
 
 void player_file_changed(struct track_info *ti)
