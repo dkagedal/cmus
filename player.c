@@ -566,6 +566,42 @@ static void _player_status_changed(void)
 
 /* updating player status }}} */
 
+/* Copy one block of data from the input to the player buffer. Returns
+ * 0 if ip_read returned 0, indicating EOF, and 1 otherwise. Called
+ * with the producer lock held. */
+static int buffer_one_chunk(void)
+{
+        int nr_read, size;
+        char *wpos;
+
+        size = buffer_get_wpos(&wpos);
+        if (size == 0) {
+                /* buffer is full */
+                producer_unlock();
+                ms_sleep(50);
+                producer_lock();
+                return 1;
+        }
+        nr_read = ip_read(ip, wpos, size);
+        if (nr_read < 0) {
+                if (nr_read == -1 && errno == EAGAIN) {
+                        return 1;
+                }
+                player_ip_error(nr_read, "reading file %s",
+                                ip_get_filename(ip));
+                /* ip_read sets eof */
+                nr_read = 0;
+        }
+        if (ip_metadata_changed(ip))
+                metadata_changed();
+
+        /* buffer_fill with 0 count marks current chunk filled */
+        buffer_fill(nr_read);
+        _producer_buffer_fill_update();
+        return !!nr_read;
+}
+
+/* Fill the player buffer with at least 250 ms worth of data, if possible. */
 static void _prebuffer(void)
 {
 	int limit_chunks;
@@ -582,39 +618,7 @@ static void _prebuffer(void)
 		if (limit_chunks < 1)
 			limit_chunks = 1;
 	}
-	while (1) {
-		int nr_read, size, filled;
-		char *wpos;
-
-		filled = buffer_get_filled_chunks();
-/* 		d_print("PREBUF: %2d / %2d\n", filled, limit_chunks); */
-
-		/* not fatal */
-		//BUG_ON(filled > limit_chunks);
-
-		if (filled >= limit_chunks)
-			break;
-
-		size = buffer_get_wpos(&wpos);
-		nr_read = ip_read(ip, wpos, size);
-		if (nr_read < 0) {
-			if (nr_read == -1 && errno == EAGAIN)
-				continue;
-			player_ip_error(nr_read, "reading file %s", ip_get_filename(ip));
-			/* ip_read sets eof */
-			nr_read = 0;
-		}
-		if (ip_metadata_changed(ip))
-			metadata_changed();
-
-		/* buffer_fill with 0 count marks current chunk filled */
-		buffer_fill(nr_read);
-
-		_producer_buffer_fill_update();
-		if (nr_read == 0) {
-			/* EOF */
-			break;
-		}
+	while (buffer_get_filled_chunks() < limit_chunks && buffer_one_chunk()) {
 	}
 }
 
@@ -990,38 +994,7 @@ static void _producer_buffer(void)
         const int chunks = 1;
 
         for (int i = 0; i < chunks; i++) {
-                int nr_read, size;
-                char *wpos;
-
-                size = buffer_get_wpos(&wpos);
-                if (size == 0) {
-                        /* buffer is full */
-                        producer_unlock();
-                        ms_sleep(50);
-                        producer_lock();
-                        return;
-                }
-                nr_read = ip_read(ip, wpos, size);
-                if (nr_read < 0) {
-                        if (nr_read == -1 && errno == EAGAIN) {
-                                producer_unlock();
-                                ms_sleep(50);
-                                producer_lock();
-                                return;
-                        }
-                        player_ip_error(nr_read, "reading file %s",
-                                        ip_get_filename(ip));
-                        /* ip_read sets eof */
-                        nr_read = 0;
-                }
-                if (ip_metadata_changed(ip))
-                        metadata_changed();
-
-                /* buffer_fill with 0 count marks current chunk filled */
-                buffer_fill(nr_read);
-                _producer_buffer_fill_update();
-
-                if (nr_read == 0) {
+                if (!buffer_one_chunk()) {
                         /* consumer handles EOF */
                         producer_unlock();
                         ms_sleep(50);
