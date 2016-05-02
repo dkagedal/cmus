@@ -1133,8 +1133,8 @@ void player_pause(void)
 		player_stop();
 		return;
 	}
-	player_lock();
 
+	player_lock();
 	if (consumer_status == CS_STOPPED) {
 		_producer_play();
 		if (producer_status == PS_PLAYING) {
@@ -1145,13 +1145,11 @@ void player_pause(void)
 		_player_status_changed();
 		if (consumer_status == CS_PLAYING)
 			_prebuffer();
-		player_unlock();
-		return;
-	}
-
-	_producer_pause();
-	_consumer_pause();
-	_player_status_changed();
+	} else {
+                _producer_pause();
+                _consumer_pause();
+                _player_status_changed();
+        }
 	player_unlock();
 }
 
