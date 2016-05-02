@@ -517,7 +517,7 @@ static void _producer_buffer_fill_update(void)
 }
 
 /*
- * playing position changed
+ * Playing position changed. Must be called with consumer lock held.
  */
 static void _consumer_position_update(void)
 {
@@ -848,98 +848,132 @@ static void _consumer_handle_eof(void)
 	_player_status_changed();
 }
 
-static void *consumer_loop(void *arg)
+/*
+ * Called when there was nothing more to consume in the buffer.Must be
+ * called with the consumer lock held. Output is the same as
+ * buffer_get_rpos().
+ */
+static int _no_more_input(char **rpos)
 {
-	while (1) {
-		int rc, space;
-		int size;
-		char *rpos;
+	int size = 0;
+	int underrun = 0;
 
-		consumer_lock();
-		if (!consumer_running)
-			break;
-
-		if (consumer_status == CS_PAUSED || consumer_status == CS_STOPPED) {
-			pthread_cond_wait(&consumer_playing, &consumer_mutex);
-			consumer_unlock();
-			continue;
-		}
-		space = op_buffer_space();
-		if (space < 0) {
-			d_print("op_buffer_space returned %d %s\n", space,
-					space == -1 ? strerror(errno) : "");
-
-			/* try to reopen */
-			op_close();
-			_consumer_status_update(CS_STOPPED);
-			_consumer_play();
-
-			consumer_unlock();
-			continue;
-		}
-/* 		d_print("BS: %6d %3d\n", space, space * 1000 / (44100 * 2 * 2)); */
-
-		while (1) {
-			if (space == 0) {
+        /* TODO: Restructure code to not take producer lock from
+         * consumer thread. This should shold be done by signalling
+         * EOF through the buffer. */
+	producer_lock();
+	if (producer_status == PS_PLAYING) {
+		/* must recheck rpos */
+		size = buffer_get_rpos(rpos);
+		if (size == 0) {
+			/* OK. now it's safe to check if we are at EOF */
+			if (ip_eof(ip)) {
+				/* EOF */
+				_consumer_handle_eof();
+			} else {
+				/* possible underrun */
+				underrun = 1;
 				_consumer_position_update();
-				consumer_unlock();
-				ms_sleep(25);
-				break;
 			}
-			size = buffer_get_rpos(&rpos);
-			if (size == 0) {
-				producer_lock();
-				if (producer_status != PS_PLAYING) {
-					producer_unlock();
-					consumer_unlock();
-					break;
-				}
-				/* must recheck rpos */
-				size = buffer_get_rpos(&rpos);
-				if (size == 0) {
-					/* OK. now it's safe to check if we are at EOF */
-					if (ip_eof(ip)) {
-						/* EOF */
-						_consumer_handle_eof();
-						producer_unlock();
-						consumer_unlock();
-						break;
-					} else {
-						/* possible underrun */
-						producer_unlock();
-						_consumer_position_update();
-						consumer_unlock();
-/* 						d_print("possible underrun\n"); */
-						ms_sleep(10);
-						break;
-					}
-				}
-
-				/* player_buffer and ip.eof were inconsistent */
-				producer_unlock();
-			}
-			if (size > space)
-				size = space;
-			if (soft_vol || replaygain)
-				scale_samples(rpos, (unsigned int *)&size);
-			rc = op_write(rpos, size);
-			if (rc < 0) {
-				d_print("op_write returned %d %s\n", rc,
-						rc == -1 ? strerror(errno) : "");
-
-				/* try to reopen */
-				op_close();
-				_consumer_status_update(CS_STOPPED);
-				_consumer_play();
-
-				consumer_unlock();
-				break;
-			}
-			buffer_consume(rc);
-			consumer_pos += rc;
-			space -= rc;
 		}
 	}
+	producer_unlock();
+
+	if (underrun) {
+/*		d_print("possible underrun\n"); */
+		/* TODO: this could be handled by a condition variable
+		 * on the buffer instead */
+		consumer_unlock();
+		ms_sleep(10);
+		consumer_lock();
+	}
+
+	return size;
+}
+
+/* Get a chunk of data from the buffer and hand it to the output.
+ * Returns the remaining space */
+static int _consume_from_buffer(int space)
+{
+	int rc, size;
+	char *rpos;
+
+	size = buffer_get_rpos(&rpos);
+	if (size == 0) {
+		size = _no_more_input(&rpos);
+		if (size == 0) {
+			/* This has already been handled in _no_more_input. */
+			return 0;
+		}
+	}
+	if (size > space)
+		size = space;
+	if (soft_vol || replaygain)
+		scale_samples(rpos, (unsigned int *)&size);
+	rc = op_write(rpos, size);
+	if (rc < 0) {
+		d_print("op_write returned %d %s\n", rc,
+			rc == -1 ? strerror(errno) : "");
+
+		/* try to reopen */
+		op_close();
+		_consumer_status_update(CS_STOPPED);
+		_consumer_play();
+
+		return 0;
+	}
+	buffer_consume(rc);
+	consumer_pos += rc;
+	return space - rc;
+}
+
+/* Fill the output with data from the buffer. Called with the consumer lock held. */
+static void _fill_output(void) {
+	int space;
+
+	space = op_buffer_space();
+	if (space < 0) {
+		d_print("op_buffer_space returned %d %s\n", space,
+			space == -1 ? strerror(errno) : "");
+
+		/* try to reopen */
+		op_close();
+		_consumer_status_update(CS_STOPPED);
+		_consumer_play();
+		return;
+	}
+/*		d_print("BS: %6d %3d\n", space, space * 1000 / (44100 * 2 * 2)); */
+	if (space == 0) {
+		/* output wasn't ready yet. Sleep for a while. */
+		_consumer_position_update();
+		consumer_unlock();
+		ms_sleep(25);
+		consumer_lock();
+		return;
+	}
+
+	while (space) {
+		space = _consume_from_buffer(space);
+	}
+}
+
+static void *consumer_loop(void *arg)
+{
+	int keep_running = 1;
+	while (keep_running) {
+		consumer_lock();
+		while (consumer_running &&
+		       (consumer_status == CS_PAUSED || consumer_status == CS_STOPPED)) {
+			pthread_cond_wait(&consumer_playing, &consumer_mutex);
+		}
+
+		if (consumer_running)
+			_fill_output();
+
+		keep_running = consumer_running;
+		consumer_unlock();
+	}
+	consumer_lock();
 	_consumer_stop();
 	consumer_unlock();
 	return NULL;
