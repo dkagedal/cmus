@@ -32,5 +32,6 @@ void buffer_consume(int count);
 int buffer_fill(int count);
 void buffer_reset(void);
 int buffer_get_filled_chunks(void);
+void buffer_wait(int n);
 
 #endif

@@ -53,6 +53,10 @@ static unsigned int buffer_widx;
 /* 1 if no more data is expected to be written to the buffer. */
 static int buffer_eof = 1;
 
+/* Signals that data has been written and is ready to be read, or that
+ * EOF has been reached. */
+static pthread_cond_t buffer_filled_cond = CMUS_COND_INITIALIZER;
+
 void buffer_init(void)
 {
 	free(buffer_chunks);
@@ -153,6 +157,7 @@ int buffer_fill(int count)
 
         buffer_eof = (count == 0);
 
+	pthread_cond_broadcast(&buffer_filled_cond);
 	cmus_mutex_unlock(&buffer_mutex);
 	return filled;
 }
@@ -173,11 +178,9 @@ void buffer_reset(void)
 	cmus_mutex_unlock(&buffer_mutex);
 }
 
-int buffer_get_filled_chunks(void)
+/* Called with the buffer lock held. */
+static int _buffer_get_filled_chunks(void)
 {
-	int c;
-
-	cmus_mutex_lock(&buffer_mutex);
 	if (buffer_ridx < buffer_widx) {
 		/*
 		 * |__##########____|
@@ -186,7 +189,7 @@ int buffer_get_filled_chunks(void)
 		 * |############____|
 		 *  r           w
 		 */
-		c = buffer_widx - buffer_ridx;
+		return buffer_widx - buffer_ridx;
 	} else if (buffer_ridx > buffer_widx) {
 		/*
 		 * |#######______###|
@@ -195,7 +198,7 @@ int buffer_get_filled_chunks(void)
 		 * |_____________###|
 		 *  w            r
 		 */
-		c = buffer_nr_chunks - buffer_ridx + buffer_widx;
+		return buffer_nr_chunks - buffer_ridx + buffer_widx;
 	} else {
 		/*
 		 * |################|
@@ -207,11 +210,29 @@ int buffer_get_filled_chunks(void)
 		 *     w
 		 */
 		if (buffer_chunks[buffer_ridx].filled) {
-			c = buffer_nr_chunks;
+			return buffer_nr_chunks;
 		} else {
-			c = 0;
+			return 0;
 		}
 	}
+}
+
+int buffer_get_filled_chunks(void)
+{
+	cmus_mutex_lock(&buffer_mutex);
+	int c = _buffer_get_filled_chunks();
 	cmus_mutex_unlock(&buffer_mutex);
 	return c;
+}
+
+/* Wait until there is at least N filled chunks of data to read, or
+ * EOF has been reached with at least one chunk filled. */
+void buffer_wait(int n) {
+    cmus_mutex_lock(&buffer_mutex);
+    int chunks = _buffer_get_filled_chunks();
+    while (chunks < n && !(buffer_eof && chunks > 0)) {
+	    pthread_cond_wait(&buffer_filled_cond, &buffer_mutex);
+	    chunks = _buffer_get_filled_chunks();
+    }
+    cmus_mutex_unlock(&buffer_mutex);
 }
