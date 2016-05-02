@@ -979,68 +979,73 @@ static void *consumer_loop(void *arg)
 	return NULL;
 }
 
+/* Do one pass of copying data from the input to the buffer. Called
+ * with the producer lock held. */
+static void _producer_buffer(void)
+{
+        /* number of chunks to fill
+         * too big   => seeking is slow
+         * too small => underruns?
+         */
+        const int chunks = 1;
+
+        for (int i = 0; i < chunks; i++) {
+                int nr_read, size;
+                char *wpos;
+
+                size = buffer_get_wpos(&wpos);
+                if (size == 0) {
+                        /* buffer is full */
+                        producer_unlock();
+                        ms_sleep(50);
+                        producer_lock();
+                        return;
+                }
+                nr_read = ip_read(ip, wpos, size);
+                if (nr_read < 0) {
+                        if (nr_read == -1 && errno == EAGAIN) {
+                                producer_unlock();
+                                ms_sleep(50);
+                                producer_lock();
+                                return;
+                        }
+                        player_ip_error(nr_read, "reading file %s",
+                                        ip_get_filename(ip));
+                        /* ip_read sets eof */
+                        nr_read = 0;
+                }
+                if (ip_metadata_changed(ip))
+                        metadata_changed();
+
+                /* buffer_fill with 0 count marks current chunk filled */
+                buffer_fill(nr_read);
+                _producer_buffer_fill_update();
+
+                if (nr_read == 0) {
+                        /* consumer handles EOF */
+                        producer_unlock();
+                        ms_sleep(50);
+                        producer_lock();
+                        return;
+                }
+        }
+}
+
 static void *producer_loop(void *arg)
 {
-	while (1) {
-		/* number of chunks to fill
-		 * too big   => seeking is slow
-		 * too small => underruns?
-		 */
-		const int chunks = 1;
-		int size, nr_read, i;
-		char *wpos;
-
+	int keep_running = 1;
+	while (keep_running) {
 		producer_lock();
-		if (!producer_running)
-			break;
-
-		if (producer_status == PS_UNLOADED ||
-		    producer_status == PS_PAUSED ||
-		    producer_status == PS_STOPPED || ip_eof(ip)) {
+		while (producer_running && (producer_status != PS_PLAYING || ip_eof(ip))) {
 			pthread_cond_wait(&producer_playing, &producer_mutex);
-			producer_unlock();
-			continue;
 		}
-		for (i = 0; ; i++) {
-			size = buffer_get_wpos(&wpos);
-			if (size == 0) {
-				/* buffer is full */
-				producer_unlock();
-				ms_sleep(50);
-				break;
-			}
-			nr_read = ip_read(ip, wpos, size);
-			if (nr_read < 0) {
-				if (nr_read != -1 || errno != EAGAIN) {
-					player_ip_error(nr_read, "reading file %s",
-							ip_get_filename(ip));
-					/* ip_read sets eof */
-					nr_read = 0;
-				} else {
-					producer_unlock();
-					ms_sleep(50);
-					break;
-				}
-			}
-			if (ip_metadata_changed(ip))
-				metadata_changed();
-
-			/* buffer_fill with 0 count marks current chunk filled */
-			buffer_fill(nr_read);
-			if (nr_read == 0) {
-				/* consumer handles EOF */
-				producer_unlock();
-				ms_sleep(50);
-				break;
-			}
-			if (i == chunks) {
-				producer_unlock();
-				/* don't sleep! */
-				break;
-			}
+		if (producer_running) {
+			_producer_buffer();
 		}
-		_producer_buffer_fill_update();
+		keep_running = producer_running;
+		producer_unlock();
 	}
+	producer_lock();
 	_producer_unload();
 	producer_unlock();
 	return NULL;
